@@ -85,73 +85,33 @@ team_t team = {
 
 static void *heap_listp;
 static void *head_free_listp = NULL;
-static void *tail_free_listp = NULL;
-
-static int debug = 0;
-
-#define SET_FREE_HEAD(ptr) \
-    do {\
-	    head_free_listp = ptr; \
-        if (head_free_listp) { \
-            PUT_PTR(PREV_PTR(head_free_listp), NULL); \
-        } \
-    } while(0) \
-    
-#define SET_FREE_TAIL(ptr) \
-	do {\
-		tail_free_listp = ptr; \
-		if (tail_free_listp) { \
-			PUT_PTR(NEXT_PTR(tail_free_listp), NULL); \
-		} \
-	} while(0) \
 
 static inline void delete_free_node(void *ptr) {
 
 	void *prevptr = GET_PTR(PREV_PTR(ptr));
 	void *nextptr = GET_PTR(NEXT_PTR(ptr));
 
-	if (nextptr == NULL && prevptr == NULL) {
-        assert(ptr == tail_free_listp);
-		assert(ptr == head_free_listp);
-        SET_FREE_TAIL(NULL);
-		SET_FREE_HEAD(NULL);
-	} else if (nextptr == NULL) {
-		assert(ptr == tail_free_listp);
-		SET_FREE_TAIL(prevptr);
-	} else if (prevptr == NULL) {
-		assert(ptr == head_free_listp);
-		SET_FREE_HEAD(nextptr);
+	if (prevptr == head_free_listp) {
+		PUT_PTR(head_free_listp, nextptr);
 	} else {
 		PUT_PTR(NEXT_PTR(prevptr), nextptr);
-		assert(nextptr != GET_PTR(PREV_PTR(prevptr)));
-		PUT_PTR(PREV_PTR(nextptr), prevptr);
-		assert(prevptr != GET_PTR(NEXT_PTR(nextptr)));
 	} 
+	
+	if (nextptr != NULL) {
+		PUT_PTR(PREV_PTR(nextptr), prevptr);
+	}
 }
+		
+static inline void insert_free_node(void *ptr) {
+	void* nextptr = GET_PTR(head_free_listp);
+	if (nextptr) {
+		PUT_PTR(PREV_PTR(nextptr), ptr); /* Prev block */
+	}
+	
+	PUT_PTR(NEXT_PTR(ptr), nextptr);         /* Next block */
+	PUT_PTR(PREV_PTR(ptr), head_free_listp); /* Prev block */
 
-static inline void move_free_node(void *fromptr, void *toptr) {
-	
-	void *prevptr = GET_PTR(PREV_PTR(fromptr));
-	void *nextptr = GET_PTR(NEXT_PTR(fromptr));
-	
-	PUT_PTR(PREV_PTR(toptr), prevptr);   /* Prev block */
-	PUT_PTR(NEXT_PTR(toptr), nextptr);   /* Next block */
-	
-	assert(prevptr == NULL || nextptr == NULL || prevptr != nextptr);
-	
-	if (nextptr == NULL) {
-		assert(fromptr == tail_free_listp);
-		SET_FREE_TAIL(toptr);
-	} else {
-		PUT_PTR(PREV_PTR(nextptr), toptr);
-	}
-	
-	if (prevptr == NULL) {
-		assert(fromptr == head_free_listp);
-		SET_FREE_HEAD(toptr);
-	} else {
-		PUT_PTR(NEXT_PTR(prevptr), toptr);
-	}
+	PUT_PTR(head_free_listp, ptr);
 }
 
 static void *coalesce(void *bp) 
@@ -161,28 +121,20 @@ static void *coalesce(void *bp)
     size_t size = GET_SIZE(HDRP(bp));
 
     if (prev_alloc && next_alloc) {
-        PUT_PTR(PREV_PTR(bp), NULL);            /* Prev block */
-        PUT_PTR(NEXT_PTR(bp), head_free_listp); /* Next block */
-		
-		if (head_free_listp) {
-			PUT_PTR(PREV_PTR(head_free_listp), bp);
-		}
-		SET_FREE_HEAD(bp);
-        if (tail_free_listp == NULL) {
-            SET_FREE_TAIL(bp);
-        }
-        return bp;
+        //pass
     } else if (prev_alloc && !next_alloc) {
-	    move_free_node(NEXT_BLKP(bp), bp);
+	    delete_free_node(NEXT_BLKP(bp));
         size += (GET_SIZE(HDRP(NEXT_BLKP(bp))));
         PUT(HDRP(bp), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
     } else if (!prev_alloc && next_alloc) {
+    	delete_free_node(PREV_BLKP(bp));
         size += (GET_SIZE(HDRP(PREV_BLKP(bp))));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         PUT(FTRP(PREV_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
     } else {
+    	delete_free_node(PREV_BLKP(bp));
 	    delete_free_node(NEXT_BLKP(bp));
         size += (GET_SIZE(HDRP(NEXT_BLKP(bp)))) + 
                 (GET_SIZE(HDRP(PREV_BLKP(bp))));
@@ -190,7 +142,10 @@ static void *coalesce(void *bp)
         PUT(FTRP(PREV_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
     }
-    return bp;
+	
+	insert_free_node(bp);
+	
+	return bp;
 }
 
 static void *extend_heap(size_t words) 
@@ -219,14 +174,21 @@ int mm_init(void)
     /* Create the initial empty heap */
     mem_init();
     
-    if ((heap_listp = mem_sbrk(4 * WSIZE)) == (void *)-1) {
+    if ((heap_listp = mem_sbrk(6 * WSIZE)) == (void *)-1) {
         return -1;
     }
+	head_free_listp = heap_listp + (1 * WSIZE);
+	
     PUT(heap_listp, 0);                            /* Alignment padding */
-    PUT(heap_listp + (1 * WSIZE), PACK(DSIZE, 1)); /* Prologue header */
-    PUT(heap_listp + (2 * WSIZE), PACK(DSIZE, 1)); /* Prologue footer */
-    PUT(heap_listp + (3 * WSIZE), PACK(0, 1));     /* Epilogue header */
-    heap_listp += (2 * WSIZE);
+    PUT(heap_listp + (1 * WSIZE), 0);
+    PUT(heap_listp + (2 * WSIZE), 0);
+	PUT(heap_listp + (3 * WSIZE), PACK(DSIZE, 1)); /* Prologue header */
+    PUT(heap_listp + (4 * WSIZE), PACK(DSIZE, 1)); /* Prologue footer */
+    PUT(heap_listp + (5 * WSIZE), PACK(0, 1));     /* Epilogue header */
+	
+    heap_listp += (4 * WSIZE);
+	
+	PUT_PTR(head_free_listp, NULL);
 
     /* Extend the empty heap with a free block of CHUNKSIZE bytes */
     if (extend_heap(CHUNKSIZE / WSIZE) == NULL) {
@@ -236,7 +198,7 @@ int mm_init(void)
 }
 
 void *find_fit(size_t asize) {
-    void *ptr = head_free_listp;
+    void *ptr = GET_PTR(head_free_listp);
     
     while (ptr) {
         if ((!GET_ALLOC(HDRP(ptr))) && GET_SIZE(HDRP(ptr)) >= asize) {
@@ -255,12 +217,13 @@ void place(void *ptr, size_t asize) {
     if ((presize - asize) >= 4 * DSIZE) {
         PUT(HDRP(ptr), PACK(asize, 1));
         PUT(FTRP(ptr), PACK(asize, 1));
-        
+		
+        delete_free_node(ptr);
+		
         PUT(HDRP(NEXT_BLKP(ptr)), PACK(presize - asize, 0));
         PUT(FTRP(NEXT_BLKP(ptr)), PACK(presize - asize, 0));
 		
-		move_free_node(ptr, NEXT_BLKP(ptr));
-		
+		insert_free_node(NEXT_BLKP(ptr));
     } else {
         PUT(HDRP(ptr), PACK(presize, 1));
         PUT(FTRP(ptr), PACK(presize, 1));
@@ -278,13 +241,12 @@ void *mm_malloc(size_t size)
     size_t asize;
     size_t extendsize;
     void  *ptr;
-
     if (0 == size) {
         return NULL;
     }
 
-    if (size < DSIZE) {
-        asize = 2 * DSIZE;
+    if (size < 2 * DSIZE) {
+        asize = 4 * DSIZE;
     } else {
         asize = DSIZE * ((size + DSIZE + (DSIZE - 1)) / DSIZE);
     }
