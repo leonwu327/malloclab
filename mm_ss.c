@@ -64,6 +64,8 @@ team_t team = {
 /* Read and write a word at address p */
 #define GET(p)          (*(unsigned int *)(p))
 #define PUT(p, val)     (*(unsigned int *)(p) = (val))
+
+#define GET_PTR(p)		(*(char **)(p))
 #define PUT_PTR(p, val) (*(char **)(p) = (val))
 
 /* Read the size and allocated fields from address p */
@@ -85,7 +87,72 @@ static void *heap_listp;
 static void *head_free_listp = NULL;
 static void *tail_free_listp = NULL;
 
-static int debug = 1;
+static int debug = 0;
+
+#define SET_FREE_HEAD(ptr) \
+    do {\
+	    head_free_listp = ptr; \
+        if (head_free_listp) { \
+            PUT_PTR(PREV_PTR(head_free_listp), NULL); \
+        } \
+    } while(0) \
+    
+#define SET_FREE_TAIL(ptr) \
+	do {\
+		tail_free_listp = ptr; \
+		if (tail_free_listp) { \
+			PUT_PTR(NEXT_PTR(tail_free_listp), NULL); \
+		} \
+	} while(0) \
+
+static inline void delete_free_node(void *ptr) {
+
+	void *prevptr = GET_PTR(PREV_PTR(ptr));
+	void *nextptr = GET_PTR(NEXT_PTR(ptr));
+
+	if (nextptr == NULL && prevptr == NULL) {
+        assert(ptr == tail_free_listp);
+		assert(ptr == head_free_listp);
+        SET_FREE_TAIL(NULL);
+		SET_FREE_HEAD(NULL);
+	} else if (nextptr == NULL) {
+		assert(ptr == tail_free_listp);
+		SET_FREE_TAIL(prevptr);
+	} else if (prevptr == NULL) {
+		assert(ptr == head_free_listp);
+		SET_FREE_HEAD(nextptr);
+	} else {
+		PUT_PTR(NEXT_PTR(prevptr), nextptr);
+		assert(nextptr != GET_PTR(PREV_PTR(prevptr)));
+		PUT_PTR(PREV_PTR(nextptr), prevptr);
+		assert(prevptr != GET_PTR(NEXT_PTR(nextptr)));
+	} 
+}
+
+static inline void move_free_node(void *fromptr, void *toptr) {
+	
+	void *prevptr = GET_PTR(PREV_PTR(fromptr));
+	void *nextptr = GET_PTR(NEXT_PTR(fromptr));
+	
+	PUT_PTR(PREV_PTR(toptr), prevptr);   /* Prev block */
+	PUT_PTR(NEXT_PTR(toptr), nextptr);   /* Next block */
+	
+	assert(prevptr == NULL || nextptr == NULL || prevptr != nextptr);
+	
+	if (nextptr == NULL) {
+		assert(fromptr == tail_free_listp);
+		SET_FREE_TAIL(toptr);
+	} else {
+		PUT_PTR(PREV_PTR(nextptr), toptr);
+	}
+	
+	if (prevptr == NULL) {
+		assert(fromptr == head_free_listp);
+		SET_FREE_HEAD(toptr);
+	} else {
+		PUT_PTR(NEXT_PTR(prevptr), toptr);
+	}
+}
 
 static void *coalesce(void *bp) 
 {
@@ -94,19 +161,19 @@ static void *coalesce(void *bp)
     size_t size = GET_SIZE(HDRP(bp));
 
     if (prev_alloc && next_alloc) {
-        /* 两边都有的情况下 */
         PUT_PTR(PREV_PTR(bp), NULL);            /* Prev block */
         PUT_PTR(NEXT_PTR(bp), head_free_listp); /* Next block */
-        printf("%p, %p, %p\n", PREV_PTR(bp), NEXT_PTR(bp), bp);
-        head_free_listp = bp;
+		
+		if (head_free_listp) {
+			PUT_PTR(PREV_PTR(head_free_listp), bp);
+		}
+		SET_FREE_HEAD(bp);
         if (tail_free_listp == NULL) {
-            tail_free_listp = head_free_listp;
+            SET_FREE_TAIL(bp);
         }
-        
+        return bp;
     } else if (prev_alloc && !next_alloc) {
-        PUT_PTR(PREV_PTR(bp), *PREV_PTR(NEXT_BLKP(bp)));   /* Prev block */
-        PUT_PTR(NEXT_PTR(bp), *NEXT_PTR(NEXT_BLKP(bp)));   /* Next block */
-
+	    move_free_node(NEXT_BLKP(bp), bp);
         size += (GET_SIZE(HDRP(NEXT_BLKP(bp))));
         PUT(HDRP(bp), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
@@ -116,15 +183,7 @@ static void *coalesce(void *bp)
         PUT(FTRP(PREV_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
     } else {
-        void *nextptr = *NEXT_PTR(NEXT_BLKP(bp));
-        if (nextptr == NULL) {
-            assert(NEXT_BLKP(bp) == tail_free_listp);
-            tail_free_listp = PREV_BLKP(bp);
-        } else {
-            PUT_PTR(PREV_PTR(nextptr), PREV_BLKP(bp)); 
-        }
-        PUT_PTR(NEXT_PTR(PREV_BLKP(bp)), nextptr);   
-        
+	    delete_free_node(NEXT_BLKP(bp));
         size += (GET_SIZE(HDRP(NEXT_BLKP(bp)))) + 
                 (GET_SIZE(HDRP(PREV_BLKP(bp))));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
@@ -136,7 +195,7 @@ static void *coalesce(void *bp)
 
 static void *extend_heap(size_t words) 
 {
-    void *bp;
+    char *bp;
     size_t size;
 
     /* Alloc an even number of words to maintain alignment */
@@ -170,23 +229,20 @@ int mm_init(void)
     heap_listp += (2 * WSIZE);
 
     /* Extend the empty heap with a free block of CHUNKSIZE bytes */
-    if ((tail_free_listp = extend_heap(CHUNKSIZE / WSIZE)) == NULL) {
+    if (extend_heap(CHUNKSIZE / WSIZE) == NULL) {
         return -1;
     }
-    
-    PRINT_HEAD_AND_TAIL();
-    
     return 0;
 }
 
 void *find_fit(size_t asize) {
     void *ptr = head_free_listp;
     
-    while (ptr && (GET_SIZE(HDRP(ptr)) > 0)) {
+    while (ptr) {
         if ((!GET_ALLOC(HDRP(ptr))) && GET_SIZE(HDRP(ptr)) >= asize) {
             return ptr;
         }
-        ptr = *NEXT_PTR(ptr);
+        ptr = GET_PTR(NEXT_PTR(ptr));
     }
 
     return NULL;
@@ -194,7 +250,6 @@ void *find_fit(size_t asize) {
 
 void place(void *ptr, size_t asize) {
     size_t presize;
-    
     presize = GET_SIZE(HDRP(ptr));
     
     if ((presize - asize) >= 4 * DSIZE) {
@@ -203,38 +258,15 @@ void place(void *ptr, size_t asize) {
         
         PUT(HDRP(NEXT_BLKP(ptr)), PACK(presize - asize, 0));
         PUT(FTRP(NEXT_BLKP(ptr)), PACK(presize - asize, 0));
-        
-        PUT_PTR(NEXT_PTR(NEXT_BLKP(ptr)), *NEXT_PTR(ptr));
-        PUT_PTR(PREV_PTR(NEXT_BLKP(ptr)), *PREV_PTR(ptr));
-        
-        if (head_free_listp == ptr) {
-            head_free_listp = NEXT_BLKP(ptr);
-        }
-        if (tail_free_listp == ptr) {
-            tail_free_listp = NEXT_BLKP(ptr);
-        }
-
+		
+		move_free_node(ptr, NEXT_BLKP(ptr));
+		
     } else {
         PUT(HDRP(ptr), PACK(presize, 1));
         PUT(FTRP(ptr), PACK(presize, 1));
-        
-        void *prevptr = *PREV_PTR(ptr);
-        void *nextptr = *NEXT_PTR(ptr);
-
-        if (prevptr) {
-            PUT_PTR(NEXT_PTR(prevptr), nextptr);
-        } else {
-            assert(head_free_listp == ptr);
-            head_free_listp = nextptr;
-        }
-        if (nextptr) {
-            PUT_PTR(PREV_PTR(nextptr), prevptr);
-        } else {
-            assert(tail_free_listp == ptr);
-            tail_free_listp = prevptr;
-        }
+		
+		delete_free_node(ptr);
     }
-    PRINT_HEAD_AND_TAIL();
 }
 
 /* 
@@ -296,7 +328,7 @@ void *mm_realloc(void *ptr, size_t size)
     newptr = mm_malloc(size);
     if (newptr == NULL)
       return NULL;
-    copySize = *(size_t *)((void *)oldptr - SIZE_T_SIZE);
+    copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
     if (size < copySize)
       copySize = size;
     memcpy(newptr, oldptr, copySize);
